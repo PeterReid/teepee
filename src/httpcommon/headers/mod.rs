@@ -1,9 +1,11 @@
 //! HTTP headers.
 
-use std::any::Any;
+use std::any::{Any, TypeId};
 use std::fmt;
 use std::io::IoResult;
 use std::string::CowString;
+use std::borrow::Cow;
+use std::mem;
 
 use std::collections::hash_map::HashMap;
 use std::collections::hash_map::Entry::{Occupied, Vacant};
@@ -15,24 +17,31 @@ mod internals;
 
 /// A trait defining the parsing of a header from a raw value.
 pub trait ToHeader {
-    /// Parse a header from one or more header field values, returning some value if successful or
-    /// `None` if parsing fails.
+    /// Parse a header from a header field value, returning some value if successful or `None` if
+    /// parsing fails.
     ///
-    /// Most headers only accept a single header field (i.e. they should return `None` if the outer
-    /// slice contains other than one value), but some may accept multiple header field values; in
-    /// such cases, they MUST be equivalent to having them all as a comma-separated single field
-    /// (RFC 7230, section 3.3.2 Field Order), with exceptions for things like dropping invalid values.
-    fn parse_header(raw_field_values: &[Vec<u8>]) -> Option<Self>;
+    /// For single-type headers, this will only be called once, with the single field value. For
+    /// list-type headers, this will be called for each value in each comma-separated field value.
+    /// That is, for the combination of HTTP headers `Foo: bar, baz` and `Foo: quux`, any `Foo`
+    /// header will get this method called three times with the raw values `b"bar"`, `b"baz"` and
+    /// `b"quux"` in order. If any individual one of these fails to parse, it is no problem—that
+    /// individual item will be the only one that is dropped. It is only where there is a genuine
+    /// syntax error (e.g. an unclosed `quoted-string`) where an entire line will be dropped—and
+    /// even then, any other lines will still be handled if possible.
+    fn parse(raw_field_value: &[u8]) -> Option<Self>;
 }
 
 /// The data type of an HTTP header for encoding and decoding.
 pub trait Header: Any + HeaderClone {
-    /// Introducing an `Err` value that does *not* come from the writer is incorrect behaviour and
-    /// may lead to task failure in certain situations. (The primary case where this will happen is
-    /// accessing a cached Box<Header> object as a different type; then, it is shoved into a buffer
-    /// through fmt_header and then back into the new type through parse_header. Should the
-    /// fmt_header call have return an Err, it will fail.
-    fn fmt_header(&self, writer: &mut Writer) -> IoResult<()>;
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result;
+
+    fn to_raw(&self) -> Vec<u8> {
+        format!("{}", HeaderDisplayAdapter(&*self)).into_bytes()
+    }
+
+    fn into_raw(self: Box<Self>) -> Vec<u8> {
+        self.to_raw()
+    }
 }
 
 mopafy!(Header);
@@ -48,6 +57,20 @@ pub trait HeaderClone {
 impl<T: Header + Clone + 'static> HeaderClone for T {
     fn clone_boxed(&self) -> Box<Header + 'static> {
         Box::new(self.clone())
+    }
+}
+
+// Would that these next two were not necessary. But alas, they are until we get negative impl
+// bounds in the language, so that Headers.set can work.
+impl<T: ToHeader + Header + Clone + 'static> Header for Vec<T> {
+    fn fmt(&self, _f: &mut fmt::Formatter) -> fmt::Result {
+        panic!("dummy impl, Vec<T> only implements Header to work around type system deficiencies")
+    }
+}
+
+impl<T: ToHeader + Header + Clone + 'static> ToHeader for Vec<T> {
+    fn parse(_raw_field_value: &[u8]) -> Option<Self> {
+        panic!("dummy impl, Vec<T> only implements ToHeader to work around type system deficiencies")
     }
 }
 
@@ -88,10 +111,10 @@ impl<T: Header + Clone + 'static> HeaderClone for T {
 /// # use std::borrow::IntoCow;
 /// # #[derive(Clone)] struct Foo;
 /// # impl httpcommon::headers::ToHeader for Foo {
-/// #     fn parse_header(_raw: &[Vec<u8>]) -> Option<Foo> { Some(Foo) }
+/// #     fn parse(_raw: &[u8]) -> Option<Foo> { Some(Foo) }
 /// # }
 /// # impl httpcommon::headers::Header for Foo {
-/// #     fn fmt_header(&self, w: &mut Writer) -> std::io::IoResult<()> { Ok(()) }
+/// #     fn fmt(&self, w: &mut Writer) -> std::io::IoResult<()> { Ok(()) }
 /// # }
 /// # struct FOO;
 /// # impl httpcommon::headers::HeaderMarker for FOO {
@@ -110,8 +133,18 @@ impl<T: Header + Clone + 'static> HeaderClone for T {
 ///
 /// And lo! `foo` is a `Foo` object corresponding to the `foo` (or `Foo`, or `fOO`, &c.) header in
 /// the request.
-pub trait HeaderMarker {
-    type Output: ToHeader + Header + Clone + 'static;
+pub trait Marker<'a> {
+    /// The fundamental header type under consideration (for list headers, H rather than Vec<H>).
+    type Base: Header + ToHeader + Clone + 'static;
+
+    /// The output of Headers.get(marker).
+    type Get: internals::Get<'a>;
+
+    /// The output of Headers.get_mut(marker).
+    type GetMut: internals::GetMut<'a>;
+
+    /// The argument to Headers.set(marker, ___).
+    type Set: Header + ToHeader + Clone + 'static;
 
     /// The name of the header that shall be used for retreiving and setting.
     ///
@@ -120,21 +153,66 @@ pub trait HeaderMarker {
     fn header_name(&self) -> CowString<'static>;
 }
 
+/// ```rust
+/// define_single_header_marker!(FOO: Foo = "foo");
+/// define_single_header_marker!(DATE: Tm = "date");
+/// define_single_header_marker!(CONTENT_LENGTH: uint = "content-length");
+/// ```
+#[macro_export]
+macro_rules! define_single_header_marker {
+    ($marker:ident: $ty:ty = $name:expr) => {
+        struct $marker;
+
+        impl<'a> $crate::headers::Marker<'a> for $marker {
+            type Base = $ty;
+            type Get = Option<$crate::headers::TypedRef<'a, $ty>>;
+            type GetMut = Option<&'a mut $ty>;
+            type Set = $ty;
+
+            fn header_name(&self) -> ::std::string::CowString<'static> {
+                ::std::borrow::Cow::Borrowed($name)
+            }
+        }
+    }
+}
+
+/// ```rust
+/// define_list_header_marker!(ALLOW: Method = "allow");
+/// define_list_header_marker!(ACCEPT: Accept = "accept");
+/// ```
+#[macro_export]
+macro_rules! define_list_header_marker {
+    ($marker:ident: $ty:ty = $name:expr) => {
+        struct $marker;
+
+        impl<'a> $crate::headers::Marker<'a> for $marker {
+            type Base = $ty;
+            type Get = $crate::headers::TypedListRef<'a, $ty>;
+            type GetMut = &'a mut Vec<$ty>;
+            type Set = Vec<$ty>;
+
+            fn header_name(&self) -> ::std::string::CowString<'static> {
+                ::std::borrow::Cow::Borrowed($name)
+            }
+        }
+    }
+}
+
 impl Clone for Box<Header + 'static> {
     fn clone(&self) -> Box<Header + 'static> {
         self.clone_boxed()
     }
 }
 
-impl Header for Box<Header + 'static> {
-    fn fmt_header(&self, w: &mut Writer) -> IoResult<()> {
-        (**self).fmt_header(w)
+impl Header for Box<Header> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        (**self).fmt(f)
     }
 }
 
-impl<'a> Header for &'static (Header + 'static) {
-    fn fmt_header(&self, w: &mut Writer) -> IoResult<()> {
-        (**self).fmt_header(w)
+impl<'a> Header for &'static Header {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        (**self).fmt(f)
     }
 }
 
@@ -263,24 +341,47 @@ impl Headers {
     /// Get a reference to a header value.
     ///
     /// The interface is strongly typed; see TODO for a more detailed explanation of how it works.
-    pub fn get<M: HeaderMarker>(&self, header_marker: M) -> Option<TypedRef<M::Output>> {
-        self.data.get(&header_marker.header_name()).and_then(|item| item.typed())
+    pub fn get<'a, M: Marker<'a>>(&'a self, marker: M) -> M::Get {
+        internals::Get::get(self.data.get(&marker.header_name()))
     }
 
     /// Get a mutable reference to a header value.
     ///
     /// The interface is strongly typed; see TODO for a more detailed explanation of how it works.
-    pub fn get_mut<M: HeaderMarker>(&mut self, header_marker: M) -> Option<&mut M::Output>
-    where M::Output: 'static {
-        self.data.get_mut(&header_marker.header_name()).and_then(|item| item.typed_mut())
+    pub fn get_mut<'a, M: Marker<'a>>(&'a mut self, marker: M) -> M::GetMut {
+        internals::GetMut::get_mut(self.data.entry(marker.header_name()))
     }
 
     /// Set the named header to the given value.
-    pub fn set<M: HeaderMarker>(&mut self, header_marker: M, value: M::Output)
-    where M::Output: 'static {
-        match self.data.entry(header_marker.header_name()) {
-            Vacant(entry) => { let _ = entry.insert(Item::from_typed(value)); },
-            Occupied(entry) => entry.into_mut().set_typed(value),
+    pub fn set<M: Marker<'static>>(&mut self, marker: M, value: M::Set) {
+        // Houston, we have a minor problem here. Unlike Get and GetMut which were unambiguous,
+        // here we have for single headers an impl for T and for list headers one for Vec<T>.
+        // We’d like to do `internals::Set::set(self.data.entry(marker.header_name()), value)`,
+        // but this wouldn’t work because of the conflicting Set implementations.
+        // So what do we do? We cheat! Yay for cheating!
+        let entry = self.data.entry(marker.header_name());
+        if TypeId::of::<Vec<M::Base>>() == TypeId::of::<M::Set>() {
+            // It’s a list header.
+            // And now we want to transmute it, but we can’t do that so simply because of generics
+            // and monomorphisation and blah blah blah. So we do even more black magic, copying the
+            // value into a new type and forgetting the old value.
+            // TODO: determine whether this is *efficient* when optimised, i.e. noop.
+            let value_vec: Vec<M::Base> = unsafe { mem::transmute_copy(&value) };
+            unsafe { mem::forget(value) }
+            match entry.get() {
+                Ok(item) => item.set_list_typed(value_vec),
+                Err(vacant) => {
+                    let _ = vacant.insert(Item::from_list_typed(value_vec));
+                },
+            }
+        } else {
+            // It’s a single header.
+            match entry.get() {
+                Ok(item) => item.set_single_typed(value),
+                Err(vacant) => {
+                    let _ = vacant.insert(Item::from_single_typed(value));
+                },
+            }
         }
     }
 
@@ -288,17 +389,17 @@ impl Headers {
     ///
     /// The returned value is a slice of each header field value.
     #[inline]
-    pub fn get_raw<M: HeaderMarker>(&self, header_marker: M) -> Option<RawRef>
-    where M::Output: 'static {
-        self.data.get(&header_marker.header_name()).map(|item| item.raw())
+    pub fn get_raw<'a, M: Marker<'a>>(&'a self, header_marker: M) -> Option<RawRef> {
+        self.data.get(&header_marker.header_name()).and_then(|item| item.raw())
     }
 
     /// Get a mutable reference to the raw values of a header, by name.
     ///
     /// The returned vector contains each header field value.
     #[inline]
-    pub fn get_raw_mut<M: HeaderMarker>(&mut self, header_marker: M) -> Option<&mut Vec<Vec<u8>>>
-    where M::Output: 'static {
+    pub fn get_raw_mut<'a, M: Marker<'a>>
+                      (&'a mut self, header_marker: M)
+                      -> Option<&mut Vec<Vec<u8>>> {
         self.data.get_mut(&header_marker.header_name()).map(|item| item.raw_mut())
     }
 
@@ -306,8 +407,7 @@ impl Headers {
     ///
     /// This invalidates the typed representation.
     #[inline]
-    pub fn set_raw<M: HeaderMarker>(&mut self, header_marker: M, value: Vec<Vec<u8>>)
-    where M::Output: 'static {
+    pub fn set_raw<'a, M: Marker<'a>>(&'a mut self, header_marker: M, value: Vec<Vec<u8>>) {
         match self.data.entry(header_marker.header_name()) {
             Vacant(entry) => { let _ = entry.insert(Item::from_raw(value)); },
             Occupied(entry) => entry.into_mut().set_raw(value),
@@ -316,34 +416,20 @@ impl Headers {
 
     /// Remove a header from the collection.
     /// Returns true if the named header was present.
-    pub fn remove<M: HeaderMarker>(&mut self, header_marker: &M) -> bool
-    where M::Output: 'static {
+    pub fn remove<'a, M: Marker<'a>>(&'a mut self, header_marker: &M) -> bool {
         self.data.remove(&header_marker.header_name()).is_some()
     }
 }
 
-/// An adapter which provides `std::fmt::Display` as equivalent to `Header.fmt_header`, so that you can
+/// An adapter which provides `std::fmt::Display` as equivalent to `Header.fmt`, so that you can
 /// actually *use* the thing.
-pub struct HeaderDisplayAdapter<'a, H: 'a>(pub &'a H);
+pub struct HeaderDisplayAdapter<'a, H: Header + ?Sized>(pub &'a H);
 
-impl<'a, H: Header> fmt::Display for HeaderDisplayAdapter<'a, H> {
+impl<'a, H: Header + ?Sized> fmt::Display for HeaderDisplayAdapter<'a, H> {
     #[inline]
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match f.write_str(&*String::from_utf8(fmt_header(self.0)).unwrap()) {
-            Ok(v) => Ok(v),
-            Err(_) => Err(fmt::Error)
-        }
+        self.0.fmt(f)
     }
-}
-
-#[inline]
-/// Convert a typed header into the raw HTTP header field value.
-pub fn fmt_header<H: Header>(h: &H) -> Vec<u8> {
-    let mut output = vec![];
-    // Result.unwrap() is correct here, for Vec won’t make an IoError,
-    // and fmt_header is not permitted to introduce one of its own.
-    h.fmt_header(&mut output).unwrap();
-    output
 }
 
 #[cfg(test_broken)]
@@ -352,7 +438,7 @@ mod tests {
 
     fn expect<H: Header + std::fmt::Display + Eq>(h: Option<H>, h_expected: H, raw: &[u8]) {
         let h = h.unwrap();
-        assert_eq!(fmt_header(&h).as_slice(), raw);
+        assert_eq!(fmt(&h).as_slice(), raw);
         assert_eq!(h, h_expected);
     }
 
@@ -373,7 +459,7 @@ mod tests {
 
         assert_eq!(headers.get(DATE), None);
         let now = time::now();
-        let now_raw = fmt_header(&now);
+        let now_raw = fmt(&now);
         headers.set(DATE, now.clone());
         expect(headers.get(DATE), now.clone(), now_raw.as_slice());
     }

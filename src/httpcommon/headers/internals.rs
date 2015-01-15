@@ -2,48 +2,140 @@
 
 use std::vec::CowVec;
 use std::borrow::{Cow, IntoCow};
+use std::string::CowString;
+use std::collections::hash_map;
 use std::ops::Deref;
+use std::any::Any;
+use std::mem;
+use std::slice;
 
 use mucell::{MuCell, Ref};
 
-use super::{ToHeader, Header, fmt_header};
+use super::{ToHeader, Header};
 
 /// All the header field values, raw or typed, with a shared field name.
 ///
-/// Each item contains a raw and/or a typed representation (but not neither!); for safety, taking a
-/// mutable reference to either invalidates the other; immutable references to not cause
-/// invalidation and so should be preferred where possible.
+/// Each item can contain a raw and a typed representation in a combination defined below; for
+/// safety, taking a mutable reference to either invalidates the other; immutable references do not
+/// cause invalidation and so should be preferred where possible.
 ///
-/// If a typed representation is invalidated, it is immediately dropped and replaced with `None`; if
-/// a raw representation is invalidated, it is *not* dropped, but rather marked as invalid: this is
-/// so that the outer vector can be reused, reducing allocation churn slightly. Trivial performance
-/// improvement, though it also increases memory usage in the mean time. That is expected to be a
-/// very small amount (<1KB across all headers) in most cases and acceptable.
+/// If a typed representation is invalidated, it is immediately dropped and replaced with `None`;
+/// if a raw representation is invalidated, it is *not* dropped, but rather marked as invalid: this
+/// is so that the outer vector can be reused, reducing allocation churn slightly. Trivial
+/// performance improvement, though it also increases memory usage in the mean time. That is
+/// expected to be a very small amount (<1KB across all headers) in most cases and acceptable.
 ///
-/// Invariants beyond those enforced by the type system:
+/// The invariants about what this can contain are, unfortunately, quite complex.
+/// Here is a list of the possible states, *not all of which represent a legal header*:
 ///
-/// - `raw == None` requires `!raw_valid`.
-/// - `raw == None && typed == None` is not legal.
-/// - `raw_valid == true` requires `raw` to be some with `.len() > 0`.
+/// - `raw == None && typed == Single`:
+///   there is a legal single-type header.
+/// - `raw == None && typed == None`:
+///   there is NOT a legal header here.
+///   This occurs if you call `get_mut` into a single-type where parsing fails.
+/// - `raw == None && typed == List with length 0`:
+///   there is NOT a legal header here.
+///   This occurs if you call `get_mut` into a list-type where parsing fails.
+/// - `raw == None && typed == List with length > 0`:
+///   there is a legal list-type header.
+/// - `raw == Some(vec with length 1) && typed == Single`:
+///   there is a legal single-type header.
+/// - `raw == Some(vec with length > 0) && typed == List with length > 0`:
+///   there is a legal list-type header.
+/// - `raw == Some(vec with length > 0) && typed == None`:
+///   there is a legal unknown-type header.
+///
+/// No other states may exist.
 struct Inner {
-    /// Whether the raw header form is valid. If a mutable reference is taken to `typed`, this will
-    /// be set to `false`, meaning that for the purposes of reading, `raw` must be considered to be
-    /// invalid and must be produced once again. This exists as a slight efficiency improvement over
-    /// just resetting `raw` to `None` in that, if the raw form is read again, the raw vectors can
-    /// be reused; this is almost certain to be faster than dropping the vectors and creating new
-    /// ones.
-    raw_valid: bool,
-
     /// A raw, unparsed header. Each item in the outer vector is a header field value, the names of
-    /// which were equivalent. Each inner vector is a string in the ISO-8859-1 character set, but
-    /// could contain things in other character sets according to the rules of RFC 2047, e.g. in a
-    /// *TEXT rule (RFC 2616 grammar).
-    ///
-    /// Reading from this is only valid if `raw_valid` is `true`.
+    /// which were equivalent. Each inner vector is opaque data with no restrictions except that CR
+    /// and LF may not appear, unless as part of an obs-fold rule (extremely much not recommended),
+    /// though it is also recommended by RFC 7230 that it be US-ASCII.
     raw: Option<Vec<Vec<u8>>>,
 
     /// A strongly typed header which has been parsed from the raw value.
-    typed: Option<Box<Header + 'static>>,
+    typed: Typed,
+}
+
+/// The representation of a strongly typed header.
+enum Typed {
+    /// There is no header stored.
+    // Yeah, we could have done `Option<InnerTyped>` and omitted this variant, but this optimises
+    // better at present (reduces memory usage by one word).
+    None,
+
+    /// The header is of a type where there is one value, e.g. `Header: value`.
+    ///
+    /// This corresponds to any header not covered by the `List` variant.
+    Single(Box<Header + 'static>),
+
+    /// The header is of a type where there are multiple values, e.g. the equivalent forms
+    /// `Header: val1, val2, val3`;
+    /// `Header: val1`, `Header: val2`, `Header: val3`; and
+    /// `Header: val1, val2`, `Header: val3`.
+    ///
+    /// This corresponds to the ABNF list extension `#rule` form described in RFC 7230 and used by
+    /// quite a large number of headers.
+    List(Box<ListHeader + 'static>),
+}
+
+trait ListHeader: Any {
+    fn into_header_iter(self: Box<Self>) -> Box<Iterator<Item = Box<Header + 'static>> + 'static>;
+    fn as_header_iter(&self) -> Box<Iterator<Item = &(Header + 'static)>>;
+
+    fn to_raw(&self) -> Vec<u8> {
+        let mut out = vec![];
+        let mut first = true;
+        // Why not a for loop? https://github.com/rust-lang/rust/issues/20953
+        let mut iter = self.as_header_iter();
+        while let Some(value) = iter.next() {
+            if first {
+                first = false;
+            } else {
+                out.push_all(b", ");
+            }
+            out.push_all(&value.to_raw()[])
+        }
+        out
+    }
+
+    fn into_raw(self: Box<Self>) -> Vec<u8> {
+        let mut out = vec![];
+        let mut first = true;
+        let mut iter = self.into_header_iter();
+        while let Some(value) = iter.next() {
+            if first {
+                first = false;
+            } else {
+                out.push_all(b", ");
+            }
+            out.push_all(&value.into_raw()[])
+        }
+        out
+    }
+}
+
+mopafy!(ListHeader);
+
+impl<H: Header + 'static> ListHeader for Vec<H> {
+    fn into_header_iter(self: Box<Self>) -> Box<Iterator<Item = Box<Header + 'static>> + 'static> {
+        #[inline] fn box_header<H: Header>(h: H) -> Box<Header + 'static> { Box::new(h) }
+        Box::new(self.into_iter().map(box_header))
+    }
+
+    fn as_header_iter(&self) -> Box<Iterator<Item = &(Header + 'static)>> {
+        #[inline] fn ref_header<H: Header>(h: &H) -> &(Header + 'static) { h }
+        Box::new(self.iter().map(ref_header))
+    }
+}
+
+impl Typed {
+    fn is_none(&self) -> bool {
+        match *self {
+            Typed::None => true,
+            _ => false,
+        }
+    }
 }
 
 #[derive(PartialEq)]
@@ -53,115 +145,261 @@ pub struct Item {
 
 impl PartialEq for Inner {
     fn eq(&self, other: &Inner) -> bool {
-        match (self, other) {
-            (&Inner { raw_valid: true, raw: Some(ref self_v), .. },
-             &Inner { raw_valid: true, raw: Some(ref other_v), .. }) => self_v == other_v,
+        self.raw_cow() == other.raw_cow()
+    }
+}
 
-            (&Inner { raw_valid: true, raw: Some(ref self_v), .. },
-             &Inner { typed: Some(ref other_h), .. }) => match &self_v[] {
-                [ref self_v_line] => self_v_line == &fmt_header(other_h),
-                _ => false,
-            },
+trait MyIteratorExt: Iterator {
+    fn into_single(self) -> Option<Self::Item>;
+}
 
-            (&Inner { typed: Some(ref self_h), .. },
-             &Inner { raw_valid: true, raw: Some(ref other_v), .. }) => match &other_v[] {
-                [ref other_v_line] => other_v_line == &fmt_header(self_h),
-                _ => false,
-            },
-
-            (&Inner { typed: Some(ref self_h), .. },
-             &Inner { typed: Some(ref other_h), .. }) => fmt_header(self_h) == fmt_header(other_h),
-
-            _ => unreachable!(),
+impl<T: Iterator> MyIteratorExt for T {
+    fn into_single(mut self) -> Option<T::Item> {
+        let output = match self.next() {
+            Some(x) => x,
+            None => return None,
+        };
+        match self.next() {
+            Some(_) => return None,
+            None => Some(output),
         }
     }
 }
 
-impl Inner {
-    fn raw_mut(&mut self, invalidate_typed: bool) -> &mut Vec<Vec<u8>> {
-        if self.raw_valid == true {
-            // All is good; we'll return the value in good time.
-        } else {
-            self.raw_valid = true;
-            match (&mut self.raw, &mut self.typed) {
-                (&mut Some(ref mut raw), &mut Some(ref typed)) => {
-                    raw.truncate(1);
-                    raw.as_mut_slice()[0] = fmt_header(typed);
-                },
+struct ValueListIter<'a> {
+    current_line: Option<&'a [u8]>,
+    lines: slice::Iter<'a, Vec<u8>>,
+}
 
-                (ref mut raw @ &mut None, &mut Some(ref typed)) => {
-                    **raw = Some(vec![fmt_header(typed)]);
-                },
+impl<'a> Iterator for ValueListIter<'a> {
+    type Item = &'a [u8];
 
-                _ => unreachable!(),
+    fn next(&mut self) -> Option<&'a [u8]> {
+        'next: loop {
+            if self.current_line.is_none() {
+                self.current_line = self.lines.next().map(|v| &**v);
             }
+            let mut line = match self.current_line {
+                Some(line) => &line[],
+                None => return None,
+            };
+
+            // Strip leading whitespace
+            match line.iter().position(|&c| c != b' ' && c != b'\t') {
+                Some(start) => line = &line[start..],
+                // It’s all whitespace, better give up and move along to the next.
+                None => continue 'next,
+            }
+
+            enum State {
+                Normal,
+                QuotedString,
+                QuotedPair,
+            }
+
+            let mut state = State::Normal;
+            let mut output = None;
+            let mut iter = line.iter().enumerate();
+            loop {
+                let (i, &byte) = match iter.next() {
+                    None => match state {
+                        State::Normal => {
+                            output = mem::replace(&mut self.current_line, None);
+                            break;
+                        },
+                        _ => {
+                            // No confidence.
+                            self.current_line = None;
+                            break;
+                        },
+                    },
+                    Some(v) => v,
+                };
+
+                state = match state {
+                    State::Normal => match byte {
+                        b',' => {
+                            // End of a value
+                            output = Some(&line[..i]);
+                            line = &line[i + 1..];
+                            break;
+                        },
+                        b'"' => State::QuotedString,
+                        // field-vchar VCHAR / obs-text
+                        b'\t' | b' ' | b'\x21'...b'\x7e' | b'\x80'...b'\xff' => State::Normal,
+                        _ => {
+                            // No confidence in any of the rest of the line.
+                            self.current_line = None;
+                            break;
+                        },
+                    },
+                    State::QuotedPair => match byte {
+                        // HTAB / SP / VCHAR / obs-text
+                        b'\t' | b' ' | b'\x21'...b'\x7e' | b'\x80'...b'\xff' => State::QuotedString,
+                        _ => {
+                            // No confidence in any of the rest of the line.
+                            self.current_line = None;
+                            break;
+                        },
+                    },
+                    State::QuotedString => match byte {
+                        b'"' => State::Normal,
+                        b'\\' => State::QuotedPair,
+                        b'\t' | b' ' | b'!' | b'\x23'...b'\x5b' | b'\x5d'...b'\x7e'
+                        | b'\x80'...b'\xff' => State::QuotedString,
+                        _ => {
+                            // No confidence in any of the rest of the line.
+                            self.current_line = None;
+                            break;
+                        },
+                    },
+                }
+            }
+
+            match output {
+                Some(ref mut line) => {
+                    // Strip trailing whitespace
+                    match line.iter().rposition(|&c| c != b' ' && c != b'\t') {
+                        Some(end) => *line = &line[..end],
+                        // This wasn’t a value, so let’s move along to the next.
+                        None => continue 'next,
+                    }
+                },
+                None => (),
+            }
+
+            // RFC 7230:
+            // qdtext = HTAB / SP / "!" / %x23-5B ; '#'-'['
+            //  / %x5D-7E ; ']'-'~'
+            //  / obs-text
+            // query = <query, see [RFC3986], Section 3.4>
+            // quoted-pair = "\" ( HTAB / SP / VCHAR / obs-text )
+            // quoted-string = DQUOTE *( qdtext / quoted-pair ) DQUOTE
         }
-        if invalidate_typed {
-            self.typed = None;
+    }
+}
+
+trait RawHeaderExt {
+    fn to_value_list_iter(&self) -> ValueListIter;
+}
+
+impl RawHeaderExt for [Vec<u8>] {
+    fn to_value_list_iter(&self) -> ValueListIter {
+        ValueListIter {
+            current_line: None,
+            lines: self.iter(),
         }
-        self.raw.as_mut().unwrap()
+    }
+}
+
+#[test]
+fn test_value_list_iter() {
+    fn c(input: &[Vec<u8>], output: &[&'static [u8]]) {
+        assert_eq!(input.to_value_list_iter().collect(), output);
+    }
+
+    c([b"foo".to_vec()], [b"foo"]);
+    c([b"foo,bar".to_vec()], [b"foo", b"bar"]);
+    c([b"foo ,bar,".to_vec()], [b"foo", b"bar"]);
+    c([b"foo , ,bar,charlie   ".to_vec()], [b"foo", b"bar", b"charlie"]);
+    c([b"".to_vec()], []);
+    c([b",".to_vec()], []);
+    c([b",   ,".to_vec()], []);
+    // TODO: add more and more interesting cases.
+}
+
+impl Inner {
+    fn raw_mut(&mut self, invalidate_others: bool) -> &mut Vec<Vec<u8>> {
+        if self.raw.is_none() {
+            self.raw = Some(if invalidate_others {
+                match mem::replace(&mut self.typed, Typed::None) {
+                    Typed::None => vec![],
+                    Typed::Single(single) => vec![single.into_raw()],
+                    Typed::List(list) => vec![list.to_raw()],
+                }
+            } else {
+                match self.typed {
+                    Typed::None => vec![],
+                    Typed::Single(ref single) => vec![single.to_raw()],
+                    Typed::List(ref list) => vec![list.to_raw()],
+                }
+            });
+        }
+        match self.raw {
+            Some(ref mut out) => out,
+            None => unreachable!(),
+        }
     }
 
     // Moo!
-    fn raw_cow(&self) -> CowVec<Vec<u8>> {
-        if self.raw_valid {
-            match self.raw {
-                Some(ref vec) => vec[].into_cow(),
-                None => unreachable!(),
-            }
-        } else {
-            match self.typed {
-                Some(ref typed) => vec![fmt_header(typed)].into_cow(),
-                None => unreachable!(),
+    fn raw_cow(&self) -> Option<CowVec<Vec<u8>>> {
+        match self.raw {
+            Some(ref vec) => Some(vec[].into_cow()),
+            None => match self.typed {
+                Typed::None => None,
+                Typed::Single(ref single) => Some(vec![single.to_raw()].into_cow()),
+                Typed::List(ref list) => Some(vec![list.to_raw()].into_cow()),
             }
         }
     }
 
-    fn typed_mut<H: ToHeader + Header + 'static>(&mut self, invalidate_raw: bool) -> Option<&mut H> {
+    fn single_typed_mut<H: ToHeader + Header + 'static>
+                       (&mut self, invalidate_others: bool)
+                       -> Option<&mut H> {
+        let already_happy = match self.typed {
+            Typed::Single(ref mut h) => h.is::<H>(),
+            _ => false,
+        };
+        if !already_happy {
+            // It doesn’t matter whether typed is None, Single or List, we’ll need to have it
+            // in raw form first. Fortunately raw_mut can do this for us!
+            let h: Option<H> = {
+                let raw = match self.raw_mut(invalidate_others).iter().into_single() {
+                    Some(raw) => raw,
+                    None => return None,
+                };
+                ToHeader::parse(&raw[])
+            };
+            self.typed = match h {
+                Some(h) => Typed::Single(Box::new(h)),
+                None => Typed::None,
+            };
+        }
+        if invalidate_others {
+            self.raw = None;
+        }
         match self.typed {
-            None => {
-                debug_assert_eq!(self.raw_valid, true);
-                debug_assert!(self.raw.is_some());
-                if invalidate_raw {
-                    self.raw_valid = false;
+            Typed::Single(ref mut h) => Some(unsafe { h.downcast_mut_unchecked() }),
+            _ => None,
+        }
+    }
+
+    fn list_typed_mut<H: ToHeader + Header + 'static>
+                     (&mut self, invalidate_others: bool)
+                     -> &mut Vec<H> {
+        match self.typed {
+            Typed::List(ref mut h) if h.is::<Vec<H>>() => {
+                if invalidate_others {
+                    self.raw = None;
                 }
-                let h: Option<H> = ToHeader::parse_header(self.raw.as_ref().unwrap().as_slice());
-                match h {
-                    Some(h) => {
-                        self.typed = Some(Box::new(h) as Box<Header + 'static>);
-                        Some(unsafe { self.typed.as_mut().unwrap().downcast_mut_unchecked::<H>() })
-                    },
-                    None => None,
-                }
+                unsafe { h.downcast_mut_unchecked() }
             },
-            Some(ref mut h) if h.is::<H>() => {
-                if invalidate_raw {
-                    self.raw_valid = false;
+            _ => {
+                // It doesn’t matter whether typed is None, Single or List, we’ll need to have it
+                // in raw form first. Fortunately raw_mut can do this for us!
+                let h = self.raw_mut(invalidate_others)
+                            .to_value_list_iter()
+                            .filter_map(|value| ToHeader::parse(value))
+                            .collect::<Vec<H>>();
+                // The vector may be empty, but we do NOT change it to Typed::None.
+                // It MUST end up a Typed::List.
+                self.typed = Typed::List(Box::new(h));
+                if invalidate_others {
+                    self.raw = None;
                 }
-                Some(unsafe { h.downcast_mut_unchecked::<H>() })
-            },
-            Some(ref mut h) => {
-                if !self.raw_valid {
-                    match self.raw {
-                        Some(ref mut raw) => {
-                            raw.truncate(1);
-                            raw.as_mut_slice()[0] = fmt_header(h);
-                        },
-                        None => {
-                            self.raw = Some(vec![fmt_header(h)]);
-                        },
-                    }
-                    self.raw_valid = !invalidate_raw;
-                } else if invalidate_raw {
-                    self.raw_valid = false;
-                }
-                let otyped: Option<H> = ToHeader::parse_header(self.raw.as_ref().unwrap().as_slice());
-                match otyped {
-                    Some(typed) => {
-                        *h = Box::new(typed) as Box<Header + 'static>;
-                        Some(unsafe { h.downcast_mut_unchecked::<H>() })
-                    },
-                    None => None,
+                match self.typed {
+                    Typed::List(ref mut h) => unsafe { h.downcast_mut_unchecked() },
+                    _ => unreachable!(),
                 }
             },
         }
@@ -169,25 +407,72 @@ impl Inner {
 
     // Pass `false` to convert_if_necessary if `typed_mut` was called with the same `H`
     // immediately before; otherwise pass `true`.
-    fn typed_cow<H: ToHeader + Header + Clone + 'static>(&self, convert_if_necessary: bool) -> Option<Cow<H, H>> {
+    fn single_typed_cow<H: ToHeader + Header + Clone + 'static>
+                       (&self, convert_if_necessary: bool)
+                       -> Option<Cow<H, H>> {
         match self.typed {
-            Some(ref h) if h.is::<H>() => {
-                Some(unsafe { Cow::Borrowed(h.downcast_ref_unchecked::<H>()) })
+            Typed::Single(ref h) if h.is::<H>() => {
+                Some(unsafe { Cow::Borrowed(h.downcast_ref_unchecked()) })
             },
             _ if convert_if_necessary => {
-                ToHeader::parse_header(&*self.raw_cow()).map(|x| Cow::Owned(x))
+                self.raw_cow().and_then(
+                    |: raw| raw.iter().into_single().and_then(
+                        |: raw| ToHeader::parse(&**raw).map(|x| Cow::Owned(x))))
             },
             _ => None,
         }
     }
 
+    // Pass `false` to convert_if_necessary if `typed_mut` was called with the same `H`
+    // immediately before; otherwise pass `true`.
+    fn list_typed_cow<H: ToHeader + Header + Clone + 'static>
+                     (&self, convert_if_necessary: bool)
+                     -> CowVec<H> {
+        match self.typed {
+            Typed::List(ref h) if h.is::<Vec<H>>() => {
+                unsafe { Cow::Borrowed(&**h.downcast_ref_unchecked::<Vec<H>>()) }
+            },
+            _ if convert_if_necessary => {
+                Cow::Owned(self.raw_cow().unwrap_or(Cow::Borrowed(&[]))
+                                         .to_value_list_iter()
+                                         .filter_map(|value| ToHeader::parse(value))
+                                         .collect())
+            },
+            _ => Cow::Owned(vec![]),
+        }
+    }
+
 }
 
-mucell_ref_type! {
-    //#[doc = "TODO"]
-    struct RawRef<'a>(Inner),
-    impl Deref -> [Vec<u8>],
-    data: CowVec<'a, Vec<u8>> = |x| x.raw_cow()
+/// An immutable reference to a `MuCell`. Dereference to get at the object.
+pub struct RawRef<'a> {
+    _parent: Ref<'a, Inner>,
+    _data: CowVec<'a, Vec<u8>>,
+}
+
+#[unstable = "still a little experimental, like the whole macro"]
+impl<'a> RawRef<'a> {
+    /// Construct a reference from the cell.
+    #[unstable = "still a little experimental, like the whole macro"]
+    fn from(cell: &'a MuCell<Inner>) -> Option<RawRef<'a>> {
+        let parent = cell.borrow();
+        let x: &'a Inner = unsafe { &*(&*parent as *const Inner) };
+        match x.raw_cow() {
+            Some(data) => Some(RawRef {
+                _parent: parent,
+                _data: data,
+            }),
+            None => None,
+        }
+    }
+}
+
+#[unstable = "trait is not stable"]
+impl<'a> Deref for RawRef<'a> {
+    type Target = [Vec<u8>];
+    fn deref(&self) -> &[Vec<u8>] {
+        &*self._data
+    }
 }
 
 impl<'a> RawRef<'a> {
@@ -218,7 +503,7 @@ impl<'a, H: ToHeader + Header + Clone + 'static> TypedRef<'a, H> {
     fn from(cell: &'a MuCell<Inner>, convert_if_necessary: bool) -> Option<TypedRef<'a, H>> {
         let parent = cell.borrow();
         let inner: &'a Inner = unsafe { &*(&*parent as *const Inner) };
-        match inner.typed_cow(convert_if_necessary) {
+        match inner.single_typed_cow(convert_if_necessary) {
             Some(data) => Some(TypedRef {
                 _parent: parent,
                 _data: data,
@@ -245,30 +530,79 @@ impl<'a, H: ToHeader + Header + Clone + 'static> TypedRef<'a, H> {
     }
 }
 
+/// An immutable reference to a `MuCell`. Dereference to get at the object.
+//$(#[$attr])*
+pub struct TypedListRef<'a, H: ToHeader + Header + Clone + 'static> {
+    _parent: Option<Ref<'a, Inner>>,
+    _data: CowVec<'a, H>,
+}
+
+impl<'a, H: ToHeader + Header + Clone + 'static> TypedListRef<'a, H> {
+    /// Construct a reference from the cell.
+    fn from(cell: &'a MuCell<Inner>, convert_if_necessary: bool) -> TypedListRef<'a, H> {
+        let parent = cell.borrow();
+        let inner: &'a Inner = unsafe { &*(&*parent as *const Inner) };
+        TypedListRef {
+            _parent: Some(parent),
+            _data: inner.list_typed_cow(convert_if_necessary),
+        }
+    }
+
+    fn empty() -> TypedListRef<'a, H> {
+        TypedListRef {
+            _parent: None,
+            _data: Cow::Borrowed(&[]),
+        }
+    }
+}
+
+#[unstable = "trait is not stable"]
+impl<'a, H: ToHeader + Header + Clone + 'static> Deref for TypedListRef<'a, H> {
+    type Target = [H];
+    fn deref<'b>(&'b self) -> &'b [H] {
+        &*self._data
+    }
+}
+
+impl<'a, H: ToHeader + Header + Clone + 'static> TypedListRef<'a, H> {
+    /// Extract the owned data.
+    ///
+    /// Copies the data if it is not already owned.
+    pub fn into_owned(self) -> Vec<H> {
+        self._data.into_owned()
+    }
+}
+
 /*************************************************************************************************/
 
 impl Item {
     /// Construct a new Item from a raw representation.
-    ///
-    /// The vector given MUST contain at least one value, or this will fail.
     pub fn from_raw(raw: Vec<Vec<u8>>) -> Item {
         assert!(raw.len() > 0);
         Item {
             inner: MuCell::new(Inner {
-                raw_valid: true,
                 raw: Some(raw),
-                typed: None,
+                typed: Typed::None,
             }),
         }
     }
 
-    /// Construct a new Item from a typed representation.
-    pub fn from_typed<H: Header + 'static>(typed: H) -> Item {
+    /// Construct a new Item from a single-typed representation.
+    pub fn from_single_typed<H: Header + 'static>(typed: H) -> Item {
         Item {
             inner: MuCell::new(Inner {
-                raw_valid: false,
                 raw: None,
-                typed: Some(Box::new(typed) as Box<Header + 'static>),
+                typed: Typed::Single(Box::new(typed)),
+            }),
+        }
+    }
+
+    /// Construct a new Item from a list-typed representation.
+    pub fn from_list_typed<H: Header + 'static>(typed: Vec<H>) -> Item {
+        Item {
+            inner: MuCell::new(Inner {
+                raw: None,
+                typed: Typed::List(Box::new(typed)),
             }),
         }
     }
@@ -294,7 +628,7 @@ impl Item {
     /// dereference to get your raw reference.
     ///
     /// See also `raw_mut`, if you wish to mutate the raw representation.
-    pub fn raw(&self) -> RawRef {
+    pub fn raw(&self) -> Option<RawRef> {
         self.inner.try_mutate(|inner| { let _ = inner.raw_mut(false); });
         RawRef::from(&self.inner)
     }
@@ -304,23 +638,36 @@ impl Item {
     /// This invalidates the typed representation.
     pub fn set_raw(&mut self, raw: Vec<Vec<u8>>) {
         let inner = self.inner.borrow_mut();
-        inner.raw_valid = true;
         inner.raw = Some(raw);
-        inner.typed = None;
+        inner.typed = Typed::None;
     }
 
-    /// Get a mutable reference to the typed representation of the header values.
+    /// Get a mutable reference to the single-typed representation of the header values.
     ///
     /// Because you may modify the typed representation through this mutable reference, calling
-    /// this invalidates the raw representation; next time you want to access the value in raw
-    /// fashion, it will be produced from the typed form.
+    /// this invalidates any other representation; most notably, if this method returns `None`,
+    /// know that any data that was in `self` before has been irretrievably lost and you may be
+    /// left with an `Item` devoid of data. Next time you want to access the value in any other
+    /// fashion, it will be produced from this typed form.
     ///
-    /// Only use this if you need to mutate the typed form; if you don't, use `typed`.
-    pub fn typed_mut<H: ToHeader + Header + 'static>(&mut self) -> Option<&mut H> {
-        self.inner.borrow_mut().typed_mut(true)
+    /// Only use this if you need to mutate the typed form; if you don't, use `single_typed`.
+    pub fn single_typed_mut<H: ToHeader + Header + 'static>(&mut self) -> Option<&mut H> {
+        self.inner.borrow_mut().single_typed_mut(true)
     }
 
-    /// Get a reference to the typed representation of the header values.
+    /// Get a mutable reference to the list-typed representation of the header values.
+    ///
+    /// Because you may modify the typed representation through this mutable reference, calling
+    /// this invalidates any other representation; any values or lines which do not parse will be
+    /// irretrievably lost. Next time you want to access the value in any other fashion, it will be
+    /// produced from this typed form.
+    ///
+    /// Only use this if you need to mutate the typed form; if you don't, use `typed`.
+    pub fn list_typed_mut<H: ToHeader + Header + 'static>(&mut self) -> &mut Vec<H> {
+        self.inner.borrow_mut().list_typed_mut(true)
+    }
+
+    /// Get a reference to the single-typed representation of the header values.
     ///
     /// If a valid typed representation exists, it will be used, making this a very cheap
     /// operation; if it does not, then the raw representation will be converted to typed form and
@@ -329,23 +676,93 @@ impl Item {
     /// get the owned vector. In summary, it doesn't much matter; you'll get an object that you
     /// can dereference to get your typed reference.
     ///
-    /// See also `typed_mut`, if you wish to mutate the typed representation.
-    pub fn typed<H: ToHeader + Header + Clone + 'static>(&self) -> Option<TypedRef<H>> {
+    /// See also `single_typed_mut`, if you wish to mutate the single-typed representation.
+    pub fn single_typed<H: ToHeader + Header + Clone + 'static>(&self) -> Option<TypedRef<H>> {
         let convert_if_necessary = self.inner.try_mutate(|inner| {
-            let _ = inner.typed_mut::<H>(false);
+            let _ = inner.single_typed_mut::<H>(false);
         });
         TypedRef::from(&self.inner, convert_if_necessary)
     }
 
-    /// Set the typed form of the header.
+    /// Get a reference to the list-typed representation of the header values.
+    ///
+    /// If a valid typed representation exists, it will be used, making this a very cheap
+    /// operation; if it does not, then the raw representation will be converted to typed form and
+    /// you will then get a reference to that. If there are no immutable references already taken,
+    /// it will be stored just in case you do it again and you’ll get a reference, otherwise you’ll
+    /// get the owned vector. In summary, it doesn't much matter; you'll get an object that you
+    /// can dereference to get your typed reference.
+    ///
+    /// See also `list_typed_mut`, if you wish to mutate the list-typed representation.
+    pub fn list_typed<H: ToHeader + Header + Clone + 'static>(&self) -> TypedListRef<H> {
+        let convert_if_necessary = self.inner.try_mutate(|inner| {
+            let _ = inner.list_typed_mut::<H>(false);
+        });
+        TypedListRef::from(&self.inner, convert_if_necessary)
+    }
+
+    /// Set the typed form of the header as a single-type.
     ///
     /// This invalidates the raw representation.
-    pub fn set_typed<H: Header + 'static>(&mut self, value: H) {
+    pub fn set_single_typed<H: Header + 'static>(&mut self, value: H) {
         let inner = self.inner.borrow_mut();
-        inner.raw_valid = false;
-        inner.typed = Some(Box::new(value) as Box<Header + 'static>);
+        inner.raw = None;
+        inner.typed = Typed::Single(Box::new(value));
+    }
+
+    /// Set the typed form of the header as a list-type.
+    ///
+    /// This invalidates the raw representation.
+    pub fn set_list_typed<H: Header + 'static>(&mut self, value: Vec<H>) {
+        let inner = self.inner.borrow_mut();
+        inner.raw = None;
+        inner.typed = Typed::List(Box::new(value));
     }
 }
+
+pub trait Get<'a> {
+    fn get(item: Option<&'a Item>) -> Self;
+}
+
+impl<'a, T: ToHeader + Header + Clone + 'static> Get<'a> for Option<TypedRef<'a, T>> {
+    fn get(item: Option<&'a Item>) -> Self {
+        // TODO: consider shifting that method into here, if appropriate; ditto for all the rest
+        item.and_then(|item| item.single_typed())
+    }
+}
+
+impl<'a, T: ToHeader + Header + Clone + 'static> Get<'a> for TypedListRef<'a, T> {
+    fn get(item: Option<&'a Item>) -> Self {
+        match item {
+            Some(item) => item.list_typed(),
+            None => TypedListRef::empty(),
+        }
+    }
+}
+
+pub trait GetMut<'a> {
+    fn get_mut(entry: hash_map::Entry<'a, CowString<'static>, Item>) -> Self;
+}
+
+impl<'a, T: ToHeader + Header + Clone + 'static> GetMut<'a> for Option<&'a mut T> {
+    fn get_mut(entry: hash_map::Entry<'a, CowString<'static>, Item>) -> Self {
+        match entry.get() {
+            Ok(item) => item.single_typed_mut(),
+            Err(_vacant) => None,
+        }
+    }
+}
+
+impl<'a, T: ToHeader + Header + Clone + 'static> GetMut<'a> for &'a mut Vec<T> {
+    fn get_mut(entry: hash_map::Entry<'a, CowString<'static>, Item>) -> Self {
+        match entry.get() {
+            Ok(item) => item,
+            Err(vacant) => vacant.insert(Item::from_list_typed::<T>(vec![]))
+        }.list_typed_mut()
+    }
+}
+
+// -- START TODO UPDATING FOR FIRST CLASS LISTS --
 
 #[cfg(test)]
 impl Inner {
@@ -389,7 +806,7 @@ mod tests {
     }
 
     impl Header for StrongType {
-        fn fmt_header(&self, w: &mut Writer) -> IoResult<()> {
+        fn fmt(&self, w: &mut Writer) -> IoResult<()> {
             let StrongType(ref vec) = *self;
             let mut first = true;
             for field in vec.iter() {
@@ -415,9 +832,9 @@ mod tests {
     }
 
     impl Header for NonParsingStrongType {
-        fn fmt_header(&self, w: &mut Writer) -> IoResult<()> {
+        fn fmt(&self, w: &mut Writer) -> IoResult<()> {
             let NonParsingStrongType(ref st) = *self;
-            st.fmt_header(w)
+            st.fmt(w)
         }
     }
 
@@ -585,7 +1002,7 @@ mod tests {
             let outer = $e;
             let item = outer.inner.borrow();
             let typed = match item.typed {
-                Some(ref t) => Some(super::super::fmt_header(t)),
+                Some(ref t) => Some(super::super::fmt(t)),
                 None => None,
             };
             format!("Item {{ raw_valid: {:?}, raw: {:?}, typed: {:?} }}", item.raw_valid, item.raw,
