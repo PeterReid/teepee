@@ -6,12 +6,13 @@ use std::string::CowString;
 use std::collections::hash_map;
 use std::ops::Deref;
 use std::any::Any;
+use std::fmt;
 use std::mem;
 use std::slice;
 
 use mucell::{MuCell, Ref};
 
-use super::{ToHeader, Header};
+use super::{ToHeader, Header, HeaderDisplayAdapter};
 
 /// All the header field values, raw or typed, with a shared field name.
 ///
@@ -79,45 +80,25 @@ enum Typed {
     List(Box<ListHeader + 'static>),
 }
 
-trait ListHeader: Any {
+impl fmt::Debug for Typed {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match *self {
+            Typed::None => f.write_str("None"),
+            Typed::Single(ref h) => write!(f, "Single({})", HeaderDisplayAdapter(h)),
+            Typed::List(ref h) => write!(f, "List({})", HeaderDisplayAdapter(h)),
+        }
+    }
+}
+
+#[doc(hidden)]
+trait ListHeader: Header + ListHeaderClone {
     fn into_header_iter(self: Box<Self>) -> Box<Iterator<Item = Box<Header + 'static>> + 'static>;
     fn as_header_iter(&self) -> Box<Iterator<Item = &(Header + 'static)>>;
-
-    fn to_raw(&self) -> Vec<u8> {
-        let mut out = vec![];
-        let mut first = true;
-        // Why not a for loop? https://github.com/rust-lang/rust/issues/20953
-        let mut iter = self.as_header_iter();
-        while let Some(value) = iter.next() {
-            if first {
-                first = false;
-            } else {
-                out.push_all(b", ");
-            }
-            out.push_all(&value.to_raw()[])
-        }
-        out
-    }
-
-    fn into_raw(self: Box<Self>) -> Vec<u8> {
-        let mut out = vec![];
-        let mut first = true;
-        let mut iter = self.into_header_iter();
-        while let Some(value) = iter.next() {
-            if first {
-                first = false;
-            } else {
-                out.push_all(b", ");
-            }
-            out.push_all(&value.into_raw()[])
-        }
-        out
-    }
 }
 
 mopafy!(ListHeader);
 
-impl<H: Header + 'static> ListHeader for Vec<H> {
+impl<H: ToHeader + Header + Clone + 'static> ListHeader for Vec<H> {
     fn into_header_iter(self: Box<Self>) -> Box<Iterator<Item = Box<Header + 'static>> + 'static> {
         #[inline] fn box_header<H: Header>(h: H) -> Box<Header + 'static> { Box::new(h) }
         Box::new(self.into_iter().map(box_header))
@@ -129,12 +110,29 @@ impl<H: Header + 'static> ListHeader for Vec<H> {
     }
 }
 
-impl Typed {
-    fn is_none(&self) -> bool {
-        match *self {
-            Typed::None => true,
-            _ => false,
-        }
+/// `Clone`, but producing boxed headers.
+#[doc(hidden)]
+pub trait ListHeaderClone {
+    /// Clone self as a boxed header.
+    #[inline]
+    fn clone_boxed_list(&self) -> Box<ListHeader + 'static>;
+}
+
+impl<T: ListHeader + Clone + 'static> ListHeaderClone for T {
+    fn clone_boxed_list(&self) -> Box<ListHeader + 'static> {
+        Box::new(self.clone())
+    }
+}
+
+impl Clone for Box<ListHeader + 'static> {
+    fn clone(&self) -> Box<ListHeader + 'static> {
+        self.clone_boxed_list()
+    }
+}
+
+impl Header for Box<ListHeader> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        (**self).fmt(f)
     }
 }
 
@@ -143,12 +141,20 @@ pub struct Item {
     inner: MuCell<Inner>,
 }
 
+impl fmt::Debug for Item {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let inner = self.inner.borrow();
+        write!(f, "Item {{ raw: {:?}, typed: {:?} }}", inner.raw, inner.typed)
+    }
+}
+
 impl PartialEq for Inner {
     fn eq(&self, other: &Inner) -> bool {
         self.raw_cow() == other.raw_cow()
     }
 }
 
+#[doc(hidden)]
 trait MyIteratorExt: Iterator {
     fn into_single(self) -> Option<Self::Item>;
 }
@@ -171,11 +177,15 @@ struct ValueListIter<'a> {
     lines: slice::Iter<'a, Vec<u8>>,
 }
 
+macro_rules! DEBUG { ($($x:tt)*) => (println!($($x)*)) }
+macro_rules! DEBUG { ($($x:tt)*) => (()) }
+
 impl<'a> Iterator for ValueListIter<'a> {
     type Item = &'a [u8];
 
     fn next(&mut self) -> Option<&'a [u8]> {
         'next: loop {
+            DEBUG!("Getting a line…");
             if self.current_line.is_none() {
                 self.current_line = self.lines.next().map(|v| &**v);
             }
@@ -183,13 +193,18 @@ impl<'a> Iterator for ValueListIter<'a> {
                 Some(line) => &line[],
                 None => return None,
             };
+            DEBUG!("Working with line  {:?}", line);
 
             // Strip leading whitespace
             match line.iter().position(|&c| c != b' ' && c != b'\t') {
                 Some(start) => line = &line[start..],
                 // It’s all whitespace, better give up and move along to the next.
-                None => continue 'next,
+                None => {
+                    self.current_line = None;
+                    continue 'next;
+                },
             }
+            DEBUG!("Line stripped, now {:?}", line);
 
             enum State {
                 Normal,
@@ -204,10 +219,13 @@ impl<'a> Iterator for ValueListIter<'a> {
                 let (i, &byte) = match iter.next() {
                     None => match state {
                         State::Normal => {
-                            output = mem::replace(&mut self.current_line, None);
+                            self.current_line = None;
+                            output = Some(line);
+                            DEBUG!("EOL, output        {:?}", output);
                             break;
                         },
                         _ => {
+                            DEBUG!("Ran out of bytes in a non-Normal state, giving up on line");
                             // No confidence.
                             self.current_line = None;
                             break;
@@ -221,13 +239,16 @@ impl<'a> Iterator for ValueListIter<'a> {
                         b',' => {
                             // End of a value
                             output = Some(&line[..i]);
-                            line = &line[i + 1..];
+                            self.current_line = Some(&line[i + 1..]);
+                            DEBUG!("EOV, output        {:?}", output);
+                            DEBUG!("     current_line  {:?}", self.current_line);
                             break;
                         },
                         b'"' => State::QuotedString,
                         // field-vchar VCHAR / obs-text
                         b'\t' | b' ' | b'\x21'...b'\x7e' | b'\x80'...b'\xff' => State::Normal,
                         _ => {
+                            DEBUG!("Illegal characters in Normal state, giving up on line");
                             // No confidence in any of the rest of the line.
                             self.current_line = None;
                             break;
@@ -237,6 +258,7 @@ impl<'a> Iterator for ValueListIter<'a> {
                         // HTAB / SP / VCHAR / obs-text
                         b'\t' | b' ' | b'\x21'...b'\x7e' | b'\x80'...b'\xff' => State::QuotedString,
                         _ => {
+                            DEBUG!("Illegal characters in QuotedPair state, giving up on line");
                             // No confidence in any of the rest of the line.
                             self.current_line = None;
                             break;
@@ -248,6 +270,7 @@ impl<'a> Iterator for ValueListIter<'a> {
                         b'\t' | b' ' | b'!' | b'\x23'...b'\x5b' | b'\x5d'...b'\x7e'
                         | b'\x80'...b'\xff' => State::QuotedString,
                         _ => {
+                            DEBUG!("Illegal characters in QuotedString state, giving up on line");
                             // No confidence in any of the rest of the line.
                             self.current_line = None;
                             break;
@@ -258,11 +281,19 @@ impl<'a> Iterator for ValueListIter<'a> {
 
             match output {
                 Some(ref mut line) => {
+                    DEBUG!("Maybe got something to return, {:?}", &line[]);
                     // Strip trailing whitespace
                     match line.iter().rposition(|&c| c != b' ' && c != b'\t') {
-                        Some(end) => *line = &line[..end],
+                        Some(end) => {
+                            DEBUG!("Happy! Returning {:?}", &line[..end + 1]);
+                            return Some(&line[..end + 1]);
+                        },
                         // This wasn’t a value, so let’s move along to the next.
-                        None => continue 'next,
+                        None => {
+                            DEBUG!("Value was purely whitespace, skipping it");
+                            //self.current_line = None;
+                            continue 'next;
+                        },
                     }
                 },
                 None => (),
@@ -279,6 +310,7 @@ impl<'a> Iterator for ValueListIter<'a> {
     }
 }
 
+#[doc(hidden)]
 trait RawHeaderExt {
     fn to_value_list_iter(&self) -> ValueListIter;
 }
@@ -292,19 +324,34 @@ impl RawHeaderExt for [Vec<u8>] {
     }
 }
 
-#[test]
-fn test_value_list_iter() {
-    fn c(input: &[Vec<u8>], output: &[&'static [u8]]) {
-        assert_eq!(input.to_value_list_iter().collect(), output);
+macro_rules! value_list_iter_tests {
+    ($($name:ident: $input:expr, $expected:expr;)*) => {
+        #[cfg(test)]
+        mod value_list_iter_tests {
+            use super::RawHeaderExt;
+            $(
+                #[test]
+                fn $name() {
+                    let input = $input.iter().map(|x| x.to_vec()).collect::<Vec<_>>();
+                    let expected: &[&[u8]] = &$expected;
+                    let computed = input.to_value_list_iter().collect::<Vec<_>>();
+                    assert_eq!(&computed[], expected);
+                }
+            )*
+        }
     }
+}
 
-    c([b"foo".to_vec()], [b"foo"]);
-    c([b"foo,bar".to_vec()], [b"foo", b"bar"]);
-    c([b"foo ,bar,".to_vec()], [b"foo", b"bar"]);
-    c([b"foo , ,bar,charlie   ".to_vec()], [b"foo", b"bar", b"charlie"]);
-    c([b"".to_vec()], []);
-    c([b",".to_vec()], []);
-    c([b",   ,".to_vec()], []);
+value_list_iter_tests! {
+    simple_single:  [b"foo"],                   [b"foo"];
+    normal:         [b"foo, bar, charlie"],     [b"foo", b"bar", b"charlie"];
+    compact:        [b"foo,bar"],               [b"foo", b"bar"];
+    trailing_comma: [b"foo ,bar,"],             [b"foo", b"bar"];
+    mixtures:       [b"foo , ,bar,charlie   "], [b"foo", b"bar", b"charlie"];
+    empty:          [b""],                      [];
+    comma_only:     [b","],                     [];
+    blanks:         [b",   ,"],                 [];
+    multiline:      [b"foo, bar", b"", b"baz"], [b"foo", b"bar", b"baz"];
     // TODO: add more and more interesting cases.
 }
 
@@ -374,7 +421,7 @@ impl Inner {
         }
     }
 
-    fn list_typed_mut<H: ToHeader + Header + 'static>
+    fn list_typed_mut<H: ToHeader + Header + Clone + 'static>
                      (&mut self, invalidate_others: bool)
                      -> &mut Vec<H> {
         match self.typed {
@@ -588,7 +635,7 @@ impl Item {
     }
 
     /// Construct a new Item from a single-typed representation.
-    pub fn from_single_typed<H: Header + 'static>(typed: H) -> Item {
+    pub fn from_single_typed<H: ToHeader + Header + Clone + 'static>(typed: H) -> Item {
         Item {
             inner: MuCell::new(Inner {
                 raw: None,
@@ -598,7 +645,7 @@ impl Item {
     }
 
     /// Construct a new Item from a list-typed representation.
-    pub fn from_list_typed<H: Header + 'static>(typed: Vec<H>) -> Item {
+    pub fn from_list_typed<H: ToHeader + Header + Clone + 'static>(typed: Vec<H>) -> Item {
         Item {
             inner: MuCell::new(Inner {
                 raw: None,
@@ -663,7 +710,7 @@ impl Item {
     /// produced from this typed form.
     ///
     /// Only use this if you need to mutate the typed form; if you don't, use `typed`.
-    pub fn list_typed_mut<H: ToHeader + Header + 'static>(&mut self) -> &mut Vec<H> {
+    pub fn list_typed_mut<H: ToHeader + Header + Clone + 'static>(&mut self) -> &mut Vec<H> {
         self.inner.borrow_mut().list_typed_mut(true)
     }
 
@@ -704,7 +751,7 @@ impl Item {
     /// Set the typed form of the header as a single-type.
     ///
     /// This invalidates the raw representation.
-    pub fn set_single_typed<H: Header + 'static>(&mut self, value: H) {
+    pub fn set_single_typed<H: ToHeader + Header + Clone + 'static>(&mut self, value: H) {
         let inner = self.inner.borrow_mut();
         inner.raw = None;
         inner.typed = Typed::Single(Box::new(value));
@@ -713,13 +760,14 @@ impl Item {
     /// Set the typed form of the header as a list-type.
     ///
     /// This invalidates the raw representation.
-    pub fn set_list_typed<H: Header + 'static>(&mut self, value: Vec<H>) {
+    pub fn set_list_typed<H: ToHeader + Header + Clone + 'static>(&mut self, value: Vec<H>) {
         let inner = self.inner.borrow_mut();
         inner.raw = None;
         inner.typed = Typed::List(Box::new(value));
     }
 }
 
+#[doc(hidden)]
 pub trait Get<'a> {
     fn get(item: Option<&'a Item>) -> Self;
 }
@@ -740,6 +788,7 @@ impl<'a, T: ToHeader + Header + Clone + 'static> Get<'a> for TypedListRef<'a, T>
     }
 }
 
+#[doc(hidden)]
 pub trait GetMut<'a> {
     fn get_mut(entry: hash_map::Entry<'a, CowString<'static>, Item>) -> Self;
 }
@@ -764,59 +813,41 @@ impl<'a, T: ToHeader + Header + Clone + 'static> GetMut<'a> for &'a mut Vec<T> {
 
 // -- START TODO UPDATING FOR FIRST CLASS LISTS --
 
-#[cfg(test)]
-impl Inner {
-    fn assert_invariants(&self) {
-        assert!(self.raw.is_some() || !self.raw_valid);
-        assert!(self.raw.is_some() || self.typed.is_some());
-        assert!(!self.raw_valid || self.raw.as_ref().unwrap().len() > 0);
-    }
-}
-
+#[cfg(skip)]
 #[cfg(test)]
 #[allow(unused_mut)]
 mod tests {
-    use super::{Item, Inner};
+    use super::{Item, Inner, Typed};
     use super::super::{ToHeader, Header};
     use std::fmt;
+    use std::str;
     use std::io::IoResult;
     use mucell::MuCell;
 
-    fn mkitem<H: Header + 'static>(raw_valid: bool,
-                                   raw: Option<Vec<Vec<u8>>>,
-                                   typed: Option<H>) -> Item {
-        let item = Inner {
-            raw_valid: raw_valid,
-            raw: raw,
-            typed: typed.map(|h| Box::new(h) as Box<Header + 'static>),
-        };
-        item.assert_invariants();
-        Item { inner: MuCell::new(item) }
+    fn mkitem<H: Header + 'static>(raw: Option<Vec<Vec<u8>>>,
+                                   typed: Typed) -> Item {
+        Item {
+            inner: MuCell::new(Inner {
+                raw: raw,
+                typed: typed,
+            })
+        }
     }
 
     #[derive(PartialEq, Eq, Clone, Debug)]
-    struct StrongType(Vec<Vec<u8>>);
+    struct StrongType(Vec<u8>);
     #[allow(non_camel_case_types)]
     type st = StrongType;
 
     impl ToHeader for StrongType {
-        fn parse_header(raw: &[Vec<u8>]) -> Option<StrongType> {
-            Some(StrongType(raw.iter().map(|x| x.clone()).collect()))
+        fn parse(raw: &[u8]) -> Option<StrongType> {
+            Some(StrongType(raw.to_vec()))
         }
     }
 
     impl Header for StrongType {
-        fn fmt(&self, w: &mut Writer) -> IoResult<()> {
-            let StrongType(ref vec) = *self;
-            let mut first = true;
-            for field in vec.iter() {
-                if !first {
-                    try!(w.write(b", "));
-                }
-                try!(w.write(field.as_slice()));
-                first = false;
-            }
-            Ok(())
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str(unsafe { str::from_utf8_unchecked(&self.0[]) })
         }
     }
 
@@ -826,30 +857,30 @@ mod tests {
     type np = NonParsingStrongType;
 
     impl ToHeader for NonParsingStrongType {
-        fn parse_header(_raw: &[Vec<u8>]) -> Option<NonParsingStrongType> {
+        fn parse(_raw: &[u8]) -> Option<NonParsingStrongType> {
             None
         }
     }
 
     impl Header for NonParsingStrongType {
-        fn fmt(&self, w: &mut Writer) -> IoResult<()> {
-            let NonParsingStrongType(ref st) = *self;
-            st.fmt(w)
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            self.0.fmt(f)
         }
     }
 
     fn assert_headers_eq<H: Header + Clone + PartialEq + fmt::Debug + 'static>(item: &Item, other: &Item) {
         let item = item.inner.borrow();
         let other = other.inner.borrow();
-        item.assert_invariants();
-        assert_eq!(item.raw_valid, other.raw_valid);
         assert_eq!(item.raw, other.raw);
-        if item.typed.is_some() || other.typed.is_some() {
-            let it = item.typed.as_ref().unwrap();
-            let ot = other.typed.as_ref().unwrap();
-            let ir = it.downcast_ref::<H>().expect("assert_headers_eq: expected Some item, got None");
-            let or = ot.downcast_ref::<H>().expect("assert_headers_eq: expected Some other, got None");
-            assert_eq!(ir, or);
+        match (&item.typed, &other.typed) {
+            (&Typed::None, &Typed::None) => (),
+            (&Typed::Single(ref a), &Typed::Single(ref b)) => {
+                assert_eq!(a.downcast_ref::<H>(), b.downcast_ref::<H>());
+            },
+            (&Typed::List(ref a), &Typed::List(ref b)) => {
+                assert_eq!(a.downcast_ref::<Vec<H>>(), b.downcast_ref::<Vec<H>>());
+            },
+            _ => panic!("Inner.typed did not match between two items"),
         }
     }
 
@@ -896,56 +927,66 @@ mod tests {
     fn test_fresh_item_from_raw() {
         let item = Item::from_raw(vec![vec![]]);
         assert_headers_eq::<StrongType>(&item,
-                                        &mkitem(true, Some(vec![vec![]]), None::<StrongType>));
+                                        &mkitem(Some(vec![vec![]]), Typed::None));
     }
 
     #[test]
-    fn test_fresh_item_from_typed() {
-        let item = Item::from_typed(d1st());
-        assert_headers_eq::<StrongType>(&item, &mkitem(false, None, Some(d1st())));
+    fn test_fresh_item_from_single_typed() {
+        let item = Item::from_single_typed(d1st());
+        assert_headers_eq::<StrongType>(&item, &mkitem(None, Typed::Single(Box::new(d1st()))));
     }
 
-    macro_rules! _thing {
-        (1 $x:ident) => (Some(concat_idents!(d1, $x)()));
-        (2 $x:ident) => (Some(concat_idents!(d2, $x)()));
-        (3 $x:ident) => (Some(concat_idents!(d3, $x)()));
-        (4 $x:ident) => (Some(concat_idents!(d4, $x)()));
-        (- st) => (None::<StrongType>);
-        (- np) => (None::<NonParsingStrongType>);
-        (- $x:tt) => (None);
+    macro_rules! _raw {
+        (1) => (Some(d1raw()));
+        (2) => (Some(d1raw()));
+        (3) => (Some(d1raw()));
+        (4) => (Some(d1raw()));
+        (-) => (None);
+    }
+
+    macro_rules! _typed {
+        (1 s $x:ident) => (Typed::Single(Box::new(concat_idents!(d1_s_, $x)())));
+        (2 s $x:ident) => (Typed::Single(Box::new(concat_idents!(d2_s_, $x)())));
+        (3 s $x:ident) => (Typed::Single(Box::new(concat_idents!(d3_s_, $x)())));
+        (4 s $x:ident) => (Typed::Single(Box::new(concat_idents!(d4_s_, $x)())));
+        (1 l $x:ident) => (Typed::List(Box::new(concat_idents!(d1_l_, $x)())));
+        (2 l $x:ident) => (Typed::List(Box::new(concat_idents!(d2_l_, $x)())));
+        (3 l $x:ident) => (Typed::List(Box::new(concat_idents!(d3_l_, $x)())));
+        (4 l $x:ident) => (Typed::List(Box::new(concat_idents!(d4_l_, $x)())));
+        (- $x:tt) => (Typed::None);
     }
     macro_rules! _bool((t)=>(true);(f)=>(false));
     macro_rules! _item {
-        ($valid:tt, $raw:tt, $ty_n:tt $ty_ty:tt) => {
-            mkitem(_bool!($valid), _thing!($raw raw), _thing!($ty_n $ty_ty))
+        ($raw:tt, $ty_n:tt $ty_m:tt $ty_ty:tt) => {
+            mkitem(_raw!($raw), _typed!($ty_n $ty_m $ty_ty))
         }
     }
     macro_rules! t {
         (
             $fn_name:ident =>
-            ($s1:tt, $s2:tt, $s3a:tt $s3b:ident)
+            ($s1:tt, $s2a:tt $s2b:ident)
             $method:ident ( $(,$args:expr)* )
-            ($e1:tt, $e2:tt, $e3a:tt $e3b:ident)
+            ($e1:tt, $e2a:tt $e2b:ident)
         ) => {
             #[test]
             fn $fn_name() {
-                let mut item = _item!($s1, $s2, $s3a $s3b);
+                let mut item = _item!($s1, $s2a $s2b);
                 let _ = item.$method($($args),*);
-                assert_headers_eq::<StrongType>(&item, &_item!($e1, $e2, $e3a $e3b));
+                assert_headers_eq::<StrongType>(&item, &_item!($e1, $e2a $e2b));
             }
         };
         (
             $fn_name:ident =>
-            ($s1:tt, $s2:tt, $s3a:tt $s3b:ident)
+            ($s1:tt, $s2a:tt $s2b:ident)
             $method:ident ( $(,$args:expr)* ) / $T:ident
-            ($e1:tt, $e2:tt, $e3a:tt $e3b:ident)
+            ($e1:tt, $e2a:tt $e2b:ident)
         ) => {
             #[test]
             fn $fn_name() {
-                let mut item = _item!($s1, $s2, $s3a $s3b);
+                let mut item = _item!($s1, $s2a $s2b);
                 let _ = item.$method::<$T>($($args),*);
-                assert_headers_eq::<StrongType>(&item, &_item!($e1, $e2, $e3a $e3b));
-                assert!(item == _item!($e1, $e2, $e3a $e3b));
+                assert_headers_eq::<StrongType>(&item, &_item!($e1, $e2a $e2b));
+                assert!(item == _item!($e1, $e2a $e2b));
             }
         }
     }
@@ -958,70 +999,49 @@ mod tests {
     // disagree with me—I can see that it is a bit of a tangle. Stick at it and you should be able
     // to understand it. I'm sorry I caused you trouble.
 
-    t!(set_raw_with_raw         => (t, 1, - st) set_raw(,d3raw()) (t, 3, - st));
-    t!(set_raw_with_typed       => (f, -, 1 st) set_raw(,d3raw()) (t, 3, - st));
-    t!(set_raw_with_both        => (t, 1, 3 st) set_raw(,d3raw()) (t, 3, - st));
-    t!(set_raw_with_invalid_raw => (f, 1, 3 st) set_raw(,d3raw()) (t, 3, - st));
+    t!(set_raw_with_raw         => (1, - s st) set_raw(,d3raw()) (3, - s st));
+    t!(set_raw_with_typed       => (-, 1 s st) set_raw(,d3raw()) (3, - s st));
+    t!(set_raw_with_both        => (1, 3 s st) set_raw(,d3raw()) (3, - s st));
 
-    t!(raw_mut_with_raw         => (t, 1, - st) raw_mut()     (t, 1, - st));
-    t!(raw_mut_with_typed       => (f, -, 1 st) raw_mut()     (t, 2, - st));
-    t!(raw_mut_with_both        => (t, 1, 3 st) raw_mut()     (t, 1, - st));
-    t!(raw_mut_with_invalid_raw => (f, 1, 3 st) raw_mut()     (t, 4, - st));
+    t!(raw_mut_with_raw         => (1, - s st) raw_mut()     (1, - s st));
+    t!(raw_mut_with_typed       => (-, 1 s st) raw_mut()     (2, - s st));
+    t!(raw_mut_with_both        => (1, 3 s st) raw_mut()     (1, - s st));
 
-    t!(raw_with_raw             => (t, 1, - st) raw()         (t, 1, - st));
-    t!(raw_with_typed           => (f, -, 1 st) raw()         (t, 2, 1 st));
-    t!(raw_with_both            => (t, 1, 3 st) raw()         (t, 1, 3 st));
-    t!(raw_with_invalid_raw     => (f, 1, 3 st) raw()         (t, 4, 3 st));
+    t!(raw_with_raw             => (1, - s st) raw()         (1, - s st));
+    t!(raw_with_typed           => (-, 1 s st) raw()         (2, 1 s st));
+    t!(raw_with_both            => (1, 3 s st) raw()         (1, 3 s st));
 
-    t!(set_typed_with_raw                  => (t, 1, - st) set_typed(,d3st()) (f, 1, 3 st));
-    t!(set_typed_with_typed                => (f, -, 1 st) set_typed(,d3st()) (f, -, 3 st));
-    t!(set_typed_with_other                => (f, -, 1 np) set_typed(,d3st()) (f, -, 3 st));
-    t!(set_typed_with_other_and_invalid    => (f, 1, 1 np) set_typed(,d3st()) (f, 1, 3 st));
-    t!(set_typed_with_other_and_raw        => (t, 1, 1 np) set_typed(,d3st()) (f, 1, 3 st));
+    t!(set_single_typed_with_raw                  => (1, - s st) set_single_typed(,d3st()) (-, 3 s st));
+    t!(set_single_typed_with_typed                => (-, 1 s st) set_single_typed(,d3st()) (-, 3 s st));
+    t!(set_single_typed_with_other                => (-, 1 s np) set_single_typed(,d3st()) (-, 3 s st));
+    t!(set_single_typed_with_other_and_raw        => (1, 1 s np) set_single_typed(,d3st()) (-, 3 s st));
 
-    t!(typed_mut_with_raw                  => (t, 1, - st) typed_mut()/st (f, 1, 1 st));
-    t!(typed_mut_with_typed                => (f, -, 1 st) typed_mut()/st (f, -, 1 st));
-    t!(typed_mut_with_other                => (f, -, 3 np) typed_mut()/st (f, 4, 4 st));
-    t!(typed_mut_with_other_and_invalid    => (f, 1, 3 np) typed_mut()/st (f, 4, 4 st));
-    t!(typed_mut_with_other_and_raw        => (t, 1, 3 np) typed_mut()/st (f, 1, 1 st));
-    t!(typed_mut_with_other_np             => (f, -, 3 st) typed_mut()/np (f, 4, 3 st));
-    t!(typed_mut_with_other_and_invalid_np => (f, 1, 3 st) typed_mut()/np (f, 4, 3 st));
-    t!(typed_mut_with_other_and_raw_np     => (t, 1, 3 st) typed_mut()/np (f, 1, 3 st));
+    t!(single_typed_mut_with_raw                  => (1, - s st) single_typed_mut()/st (-, 1 s st));
+    t!(single_typed_mut_with_typed                => (-, 1 s st) single_typed_mut()/st (-, 1 s st));
+    t!(single_typed_mut_with_other                => (-, 3 s np) single_typed_mut()/st (-, 4 s st));
+    t!(single_typed_mut_with_other_and_raw        => (1, 3 s np) single_typed_mut()/st (-, 1 s st));
+    t!(single_typed_mut_with_other_np             => (-, 3 s st) single_typed_mut()/np (-, 3 s st));
+    t!(single_typed_mut_with_other_and_raw_np     => (1, 3 s st) single_typed_mut()/np (-, 3 s st));
 
-    t!(typed_with_raw                      => (t, 1, - st) typed()/st     (t, 1, 1 st));
-    t!(typed_with_typed                    => (f, -, 1 st) typed()/st     (f, -, 1 st));
-    t!(typed_with_other                    => (f, -, 3 np) typed()/st     (t, 4, 4 st));
-    t!(typed_with_other_and_invalid        => (f, 1, 3 np) typed()/st     (t, 4, 4 st));
-    t!(typed_with_other_and_raw            => (t, 1, 3 np) typed()/st     (t, 1, 1 st));
-    t!(typed_with_other_np                 => (f, -, 3 st) typed()/np     (t, 4, 3 st));
-    t!(typed_with_other_and_invalid_np     => (f, 1, 3 st) typed()/np     (t, 4, 3 st));
-    t!(typed_with_other_and_raw_np         => (t, 1, 3 st) typed()/np     (t, 1, 3 st));
-
-    macro_rules! fmtitem {
-        ($e:expr) => {{
-            let outer = $e;
-            let item = outer.inner.borrow();
-            let typed = match item.typed {
-                Some(ref t) => Some(super::super::fmt(t)),
-                None => None,
-            };
-            format!("Item {{ raw_valid: {:?}, raw: {:?}, typed: {:?} }}", item.raw_valid, item.raw,
-                    typed)
-        }}
-    }
+    t!(single_typed_with_raw                      => (1, - s st) single_typed()/st     (1, 1 s st));
+    t!(single_typed_with_typed                    => (-, 1 s st) single_typed()/st     (-, 1 s st));
+    t!(single_typed_with_other                    => (-, 3 s np) single_typed()/st     (4, 4 s st));
+    t!(single_typed_with_other_and_raw            => (1, 3 s np) single_typed()/st     (1, 1 s st));
+    t!(single_typed_with_other_np                 => (-, 3 s st) single_typed()/np     (4, 3 s st));
+    t!(single_typed_with_other_and_raw_np         => (1, 3 s st) single_typed()/np     (1, 3 s st));
 
     macro_rules! eq {
         (
             $fn_name:ident =>
-            ($s1:tt, $s2:tt, $s3a:tt $s3b:ident)
-            ($e1:tt, $e2:tt, $e3a:tt $e3b:ident)
+            ($s1:tt, $s2a:tt $s2b:ident)
+            ($e1:tt, $e2a:tt $e2b:ident)
         ) => {
             #[test]
             fn $fn_name() {
-                //assert_eq!(_item!($s1, $s2, $s3a $s3b), _item!($e1, $e2, $e3a $e3b));
-                let a = _item!($s1, $s2, $s3a $s3b);
-                let b = _item!($e1, $e2, $e3a $e3b);
-                assert!(a == b, "The two are not equal!\n{}\n{}", fmtitem!(a), fmtitem!(b))
+                //assert_eq!(_item!($s1, $s2a $s2b), _item!($e1, $e2a $e2b));
+                let a = _item!($s1, $s2a $s2b);
+                let b = _item!($e1, $e2a $e2b);
+                assert!(a == b, "The two are not equal!\n{:?}\n{:?}", a, b)
             }
         }
     }
@@ -1029,41 +1049,34 @@ mod tests {
     macro_rules! ne {
         (
             $fn_name:ident =>
-            ($s1:tt, $s2:tt, $s3a:tt $s3b:ident)
-            ($e1:tt, $e2:tt, $e3a:tt $e3b:ident)
+            ($s1:tt, $s2a:tt $s2b:ident)
+            ($e1:tt, $e2a:tt $e2b:ident)
         ) => {
             #[test]
             fn $fn_name() {
-                let a = _item!($s1, $s2, $s3a $s3b);
-                let b = _item!($e1, $e2, $e3a $e3b);
-                assert!(a != b, "The two are equal!\n{}\n{}", fmtitem!(a), fmtitem!(b))
+                let a = _item!($s1, $s2a $s2b);
+                let b = _item!($e1, $e2a $e2b);
+                assert!(a != b, "The two are equal!\n{:?}\n{:?}", a, b)
             }
         }
     }
 
     // raw = raw
-    eq!(raw_eq_raw_with_different_typed => (t, 2, 1 st) (t, 2, 1 np));
-    eq!(raw_eq_raw_with_same_typed      => (t, 2, 1 st) (t, 2, 1 st));
-    eq!(raw_eq_raw_with_one_typed       => (t, 2, 1 st) (t, 2, - st));
-    eq!(raw_eq_raw_with_neither_typed   => (t, 2, - st) (t, 2, - st));
-    ne!(raw_ne_raw_with_different_typed => (t, 2, 1 st) (t, 4, 3 np));
-    ne!(raw_ne_raw_with_same_typed      => (t, 2, 1 st) (t, 4, 3 st));
-    ne!(raw_ne_raw_with_one_typed       => (t, 2, 1 st) (t, 4, - st));
-    ne!(raw_ne_raw_with_neither_typed   => (t, 2, - st) (t, 4, - st));
+    eq!(raw_eq_raw_with_different_typed => (2, 1 st) (2, 1 np));
+    eq!(raw_eq_raw_with_same_typed      => (2, 1 st) (2, 1 st));
+    eq!(raw_eq_raw_with_one_typed       => (2, 1 st) (2, - st));
+    eq!(raw_eq_raw_with_neither_typed   => (2, - st) (2, - st));
+    ne!(raw_ne_raw_with_different_typed => (2, 1 st) (4, 3 np));
+    ne!(raw_ne_raw_with_same_typed      => (2, 1 st) (4, 3 st));
+    ne!(raw_ne_raw_with_one_typed       => (2, 1 st) (4, - st));
+    ne!(raw_ne_raw_with_neither_typed   => (2, - st) (4, - st));
 
     // raw = typed
-    eq!(raw_eq_typed_with_one_raw         => (t, 2, 3 st) (f, -, 1 st));
-    ne!(raw_ne_typed_with_one_raw         => (t, 1, 1 st) (f, -, 1 st));
-    eq!(raw_eq_typed_with_invalid_raw     => (t, 2, 3 st) (f, 3, 1 st));
-    eq!(raw_eq_typed_with_different_typed => (t, 2, 1 st) (f, -, 1 np));
+    eq!(raw_eq_typed_with_one_raw         => (2, 3 st) (-, 1 st));
+    ne!(raw_ne_typed_with_one_raw         => (1, 1 st) (-, 1 st));
+    eq!(raw_eq_typed_with_different_typed => (2, 1 st) (-, 1 np));
 
     // typed = typed
-    eq!(typed_eq_typed_with_1              => (f, -, 1 st) (f, -, 1 np));
-    eq!(typed_eq_typed_with_2              => (f, -, 1 st) (f, -, 1 st));
-    eq!(typed_eq_typed_with_3              => (f, -, 1 st) (f, 2, 1 np));
-    eq!(typed_eq_typed_with_4              => (f, -, 1 st) (f, 2, 1 st));
-    eq!(typed_eq_typed_with_5              => (f, 2, 1 st) (f, -, 1 np));
-    eq!(typed_eq_typed_with_6              => (f, 2, 1 st) (f, -, 1 st));
-    eq!(typed_eq_typed_with_7              => (f, 2, 1 st) (f, 2, 1 np));
-    eq!(typed_eq_typed_with_8              => (f, 2, 1 st) (f, 2, 1 st));
+    eq!(typed_eq_typed_with_1              => (-, 1 st) (-, 1 np));
+    eq!(typed_eq_typed_with_2              => (-, 1 st) (-, 1 st));
 }

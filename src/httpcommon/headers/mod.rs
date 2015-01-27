@@ -2,16 +2,14 @@
 
 use std::any::{Any, TypeId};
 use std::fmt;
-use std::io::IoResult;
 use std::string::CowString;
-use std::borrow::Cow;
 use std::mem;
 
 use std::collections::hash_map::HashMap;
 use std::collections::hash_map::Entry::{Occupied, Vacant};
 
 use self::internals::Item;
-pub use self::internals::{TypedRef, RawRef};
+pub use self::internals::{TypedRef, TypedListRef, RawRef};
 
 mod internals;
 
@@ -20,8 +18,8 @@ pub trait ToHeader {
     /// Parse a header from a header field value, returning some value if successful or `None` if
     /// parsing fails.
     ///
-    /// For single-type headers, this will only be called once, with the single field value. For
-    /// list-type headers, this will be called for each value in each comma-separated field value.
+    /// For single‐type headers, this will only be called once, with the single field value. For
+    /// list‐type headers, this will be called for each value in each comma‐separated field value.
     /// That is, for the combination of HTTP headers `Foo: bar, baz` and `Foo: quux`, any `Foo`
     /// header will get this method called three times with the raw values `b"bar"`, `b"baz"` and
     /// `b"quux"` in order. If any individual one of these fails to parse, it is no problem—that
@@ -33,12 +31,42 @@ pub trait ToHeader {
 
 /// The data type of an HTTP header for encoding and decoding.
 pub trait Header: Any + HeaderClone {
+    /// Convert the header to its raw value, writing it to the formatter.
+    ///
+    /// Implementers MUST only write `SP` (0x20), `HTAB` (0x09), `VCHAR` (visible US-ASCII
+    /// characters, 0x21–0x7E) or `obs`-text (0x80–0xFF), though the use of obs-text is not
+    /// advised. Things like carriage returns, line feeds and null bytes are Definitely Forbidden.
+    /// For list‐style headers there is an additional restriction: commas are only permitted inside
+    /// appropriately quoted strings, on pain of Undefined Behaviour. This is probably a good rule
+    /// to stick to in general, partially so on account of there being nothing stopping a
+    /// Header‐implementing type from being used as a list‐style header.
+    //
+    // (Well, I guess for HTTP/1 you could *probably* get away with obs-fold (e.g. `CR LF SP`), but
+    // I can’t remember off the top of my head how that’ll work for HTTP/2, and I’m definitely not
+    // advertising it in the public docs. Hence double slashes, not triple.)
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result;
 
+    /// Convert the header to its raw value, producing a new byte vector.
+    ///
+    /// The default implementation will almost always be sufficient, being based on the `fmt`
+    /// method of this trait. This method only exists as it is because I consider it conceivable at
+    /// present that there may be cases where there is a better choice. It might be shifted out of
+    /// the trait later.
+    #[unstable = "might be removed from the trait"]
     fn to_raw(&self) -> Vec<u8> {
         format!("{}", HeaderDisplayAdapter(&*self)).into_bytes()
     }
 
+    /// Convert the header to its raw value, consuming self.
+    ///
+    /// The `Box<Self>` aspect is to satisfy object safety. Hopefully this measure won’t be
+    /// necessary at some point in the future.
+    ///
+    /// The default implementation will almost always be sufficient, being based on the `to_raw`
+    /// method of this trait. This method only exists as it is because I consider it conceivable at
+    /// present that there may be cases where there is a better choice. It might be shifted out of
+    /// the trait later.
+    #[unstable = "might be removed from the trait"]
     fn into_raw(self: Box<Self>) -> Vec<u8> {
         self.to_raw()
     }
@@ -60,14 +88,24 @@ impl<T: Header + Clone + 'static> HeaderClone for T {
     }
 }
 
-// Would that these next two were not necessary. But alas, they are until we get negative impl
-// bounds in the language, so that Headers.set can work.
 impl<T: ToHeader + Header + Clone + 'static> Header for Vec<T> {
-    fn fmt(&self, _f: &mut fmt::Formatter) -> fmt::Result {
-        panic!("dummy impl, Vec<T> only implements Header to work around type system deficiencies")
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let mut first = true;
+        for h in self.iter() {
+            if first {
+                first = false;
+            } else {
+                try!(f.write_str(", "));
+            }
+            try!(h.fmt(f));
+        }
+        Ok(())
     }
 }
 
+// Would that this one was not necessary. But alas, it is until we get negative impl bounds in the
+// language, so that Headers.set can work. (It’ll still be convenient to have the Header impl for
+// Vec<T>, but we can negate on the ToHeader-ness, subtle though the point be.)
 impl<T: ToHeader + Header + Clone + 'static> ToHeader for Vec<T> {
     fn parse(_raw_field_value: &[u8]) -> Option<Self> {
         panic!("dummy impl, Vec<T> only implements ToHeader to work around type system deficiencies")
@@ -79,13 +117,18 @@ impl<T: ToHeader + Header + Clone + 'static> ToHeader for Vec<T> {
 /// Standard usage of this is very simple unit-struct marker types, like this:
 ///
 /// ```rust,ignore
+/// #[macro_use] extern crate httpcommon;
 /// use std::borrow::IntoCow;
 /// use std::string::CowString;
-/// use httpcommon::headers::{Header, HeaderMarker};
+/// use httpcommon::headers::{ToHeader, Header};
 ///
 /// // The header data type
 /// #[derive(Clone)]
 /// pub struct Foo {
+///     ...
+/// }
+///
+/// impl ToHeader for Foo {
 ///     ...
 /// }
 ///
@@ -94,33 +137,22 @@ impl<T: ToHeader + Header + Clone + 'static> ToHeader for Vec<T> {
 /// }
 ///
 /// // The marker type for accessing the header and specifying the name
-/// pub struct FOO;
-///
-/// impl HeaderMarker for FOO {
-///     type Output = Foo;
-///     fn header_name(&self) -> CowString<'static> {
-///         "foo".into_cow()
-///     }
-/// }
+/// define_single_header_marker!(FOO: Foo = "foo");
 /// ```
 ///
 /// Then, accessing the header is done like this:
 ///
 /// ```rust
-/// # extern crate httpcommon;
+/// # #[macro_use] extern crate httpcommon;
 /// # use std::borrow::IntoCow;
 /// # #[derive(Clone)] struct Foo;
 /// # impl httpcommon::headers::ToHeader for Foo {
 /// #     fn parse(_raw: &[u8]) -> Option<Foo> { Some(Foo) }
 /// # }
 /// # impl httpcommon::headers::Header for Foo {
-/// #     fn fmt(&self, w: &mut Writer) -> std::io::IoResult<()> { Ok(()) }
+/// #     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result { Ok(()) }
 /// # }
-/// # struct FOO;
-/// # impl httpcommon::headers::HeaderMarker for FOO {
-/// #     type Output = Foo;
-/// #     fn header_name(&self) -> std::string::CowString<'static> { "foo".into_cow() }
-/// # }
+/// # define_single_header_marker!(FOO: Foo = "foo");
 /// # struct Request { headers: httpcommon::headers::Headers }
 /// # fn main() {
 /// # let mut request = Request { headers: httpcommon::headers::Headers::new() };
@@ -153,7 +185,11 @@ pub trait Marker<'a> {
     fn header_name(&self) -> CowString<'static>;
 }
 
-/// ```rust
+/// Define a single-type header marker.
+///
+/// Examples:
+///
+/// ```rust,ignore
 /// define_single_header_marker!(FOO: Foo = "foo");
 /// define_single_header_marker!(DATE: Tm = "date");
 /// define_single_header_marker!(CONTENT_LENGTH: uint = "content-length");
@@ -176,7 +212,11 @@ macro_rules! define_single_header_marker {
     }
 }
 
-/// ```rust
+/// Define a single-type header marker.
+///
+/// Examples:
+///
+/// ```rust,ignore
 /// define_list_header_marker!(ALLOW: Method = "allow");
 /// define_list_header_marker!(ACCEPT: Accept = "accept");
 /// ```

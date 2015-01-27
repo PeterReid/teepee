@@ -14,6 +14,7 @@
 
 #![warn(non_upper_case_globals, unused_typecasts, missing_docs, unused_results)]
 //#![warn(unstable)]
+#![allow(unstable)]
 
 #[plugin] #[no_link]
 extern crate phf_mac;
